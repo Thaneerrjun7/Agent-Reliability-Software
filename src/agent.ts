@@ -19,6 +19,7 @@ import { dirname } from "path";
 import { pathToFileURL } from "url";
 import { MockApiClient, type ChatMessage, type ChatResponse } from "./client";
 import { validateResult, type AgentResult, type TraceLine } from "./types";
+import { checkBookingAgainstGoal, checkReadArgs } from "./goalcheck";
 
 export type AgentArgs = {
   goal: string;
@@ -142,8 +143,10 @@ export type GoalIntent = {
   wantBooking: boolean;
   wantWeather: boolean;
   nonstop: boolean;
-  budget: number | null;
+  cheapest: boolean;
+  budget: number | null; // in EUR; null when absent or in another currency
   passenger: string | null; // null when the goal names nobody: we never invent a name
+  weatherCity: string | null; // the words after "weather in", e.g. "Cairo that day"
 };
 
 export function parseGoal(goalText: string, now = new Date()): GoalIntent {
@@ -172,8 +175,11 @@ export function parseGoal(goalText: string, now = new Date()): GoalIntent {
     d.setUTCDate(d.getUTCDate() + 1);
     date = d.toISOString().slice(0, 10);
   }
-  const budgetM = text.match(/(?:under|below|less\s+than|max(?:imum)?)\s*(?:€|\$|RM|eur)?\s*(\d+)/i);
-  const passengerM = [...text.matchAll(/\b(?:for|passenger(?:\s+name)?)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?)/g)];
+  // A budget is only read when it is a plain amount in euros: not "max 2 stops", not dollars.
+  const budgetM = text.match(/(?:under|below|less\s+than|max(?:imum)?)\s*(€|\$|RM|eur)?\s*(\d+)\b(?!\s*(?:stops?|layovers?|hours?|h\b|min|usd|dollars?|rm|myr|gbp|pounds?))/i);
+  const budgetInEuros = budgetM && !/^(?:\$|RM)$/i.test(budgetM[1] ?? "");
+  const passengerM = [...text.matchAll(/\b(?:for|passenger(?:\s+name)?)\s+([A-ZÀ-Ý][A-Za-zÀ-ÿ'’-]+(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ'’-]+)?)/g)];
+  const weatherM = text.match(/\bweather\s+(?:in|for|at)\s+([^.,;:!?]+)/i);
   return {
     origin,
     dest,
@@ -181,8 +187,10 @@ export function parseGoal(goalText: string, now = new Date()): GoalIntent {
     wantBooking: /\b(book|reserve)\b/i.test(text),
     wantWeather: /\bweather\b/i.test(text),
     nonstop: /non-?stop|\bdirect\b/i.test(text),
-    budget: budgetM ? Number(budgetM[1]) : null,
+    cheapest: /\b(?:cheapest|lowest[- ]price|least expensive)\b/i.test(text),
+    budget: budgetM && budgetInEuros ? Number(budgetM[2]) : null,
     passenger: passengerM.length > 0 ? passengerM[passengerM.length - 1][1] : null,
+    weatherCity: weatherM ? weatherM[1].trim() : null,
   };
 }
 
@@ -368,6 +376,7 @@ export async function runAgent(
   const weatherFacts: Array<{ weather: CleanWeather; firstWasStale: boolean; refetchFailed: boolean }> = [];
   // Every booking this run tried, keyed by idempotency key.
   const bookingAttempts = new Map<string, BookingAttempt>();
+  const refusals = new Set<string>(); // why bookings were refused for not matching the goal (they go in the answer)
   let finalCheckFailed = false; // could not read /tools/bookings at the end
   let serverChecked = false; // the end-of-run check succeeded
   const seenReadSignatures = new Set<string>();
@@ -593,6 +602,13 @@ export async function runAgent(
           continue;
         }
       }
+      // search_flights / get_weather: usable arguments that fit the goal, checked before any API call.
+      const argProblem = checkReadArgs(name, parsedArgs, intent);
+      if (argProblem) {
+        messages = [...messages, { role: "assistant", content: null, tool_calls: [echo] }];
+        reask(argProblem);
+        continue;
+      }
       malformedStreak = 0;
 
       // --- duplicate suppression (a booking is only recorded here once it succeeded) ---
@@ -714,7 +730,8 @@ export async function runAgent(
       } else {
         // book_flight — irreversible write. Own search results only, confirm, stable key, reconcile.
         const { flight_id, passenger } = parsedArgs;
-        if (!foundFlights.has(flight_id)) {
+        const chosen = foundFlights.get(flight_id);
+        if (!chosen) {
           // The planner can be tricked by text inside tool data into booking a flight we never found.
           trace({ step: currentStep, action: name, outcome: "invalid_output", detail: "flight not in our search results; booking refused" });
           errors.push({ code: "unverified_flight", message: `book_flight: ${flight_id} was not in our search results; refused`, step: currentStep });
@@ -733,6 +750,24 @@ export async function runAgent(
                 note: `Nothing was booked. Only book a flight from your own search results: ${[...foundFlights.keys()].slice(0, 10).join(", ")}.`,
               }),
             },
+          ];
+          continue;
+        }
+
+        // The flight is ours, but is it what the goal asked for (passenger, nonstop, budget, cheapest, route)?
+        const fit = checkBookingAgainstGoal(intent, chosen, passenger, [...foundFlights.values()]);
+        if (!fit.ok) {
+          trace({ step: currentStep, action: name, outcome: "invalid_output", detail: `booking refused, does not match the goal: ${fit.reason}` });
+          errors.push({ code: "booking_not_matching_goal", message: `book_flight ${flight_id}: ${fit.reason}`, step: currentStep });
+          refusals.add(fit.reason);
+          if (failedCycleSignatures.has(signature)) {
+            throw new StopEarly("partial", "booking_not_matching_goal", "Planner kept asking for a booking that does not match the goal; stopped.");
+          }
+          failedCycleSignatures.add(signature);
+          messages = [
+            ...messages,
+            { role: "assistant", content: null, tool_calls: [{ name, arguments: JSON.stringify(parsedArgs) }] },
+            { role: "tool", content: JSON.stringify({ tool: name, result: { error: "Booking refused: it does not match the goal." }, note: `Nothing was booked. ${fit.reason}` }) },
           ];
           continue;
         }
@@ -1025,6 +1060,7 @@ export async function runAgent(
         parts.push(`Booking outcome UNKNOWN for ${what}: it could not be confirmed either way, so it is not claimed as booked. Check your bookings before trying again.`);
       }
     }
+    for (const reason of refusals) parts.push(`Refused to book: ${reason}`);
     if (intent.wantBooking && bookings.length === 0 && attempts.length === 0) {
       parts.push(searchDone && foundFlights.size === 0 ? "No booking was made: the search returned no flights." : "No booking was made.");
     }

@@ -61,7 +61,8 @@ describe("the answer is built from checked data only", () => {
   });
 
   it("says why nothing was booked when the search found no flights", async () => {
-    const { result } = await run({ planner: [SEARCH, { say: "Sorry." }], searchResults: [], goal: "Book a flight from Paris to Paris on 2026-11-01 for Anna Nowak." });
+    const searchParis = { call: "search_flights", args: { origin: "Paris", dest: "Paris", date: "2026-11-01" } }; // the goal's own route
+    const { result } = await run({ planner: [searchParis, { say: "Sorry." }], searchResults: [], goal: "Book a flight from Paris to Paris on 2026-11-01 for Anna Nowak." });
     expect(result.bookings).toHaveLength(0);
     expect(result.answer).toContain("No booking was made: the search returned no flights.");
   });

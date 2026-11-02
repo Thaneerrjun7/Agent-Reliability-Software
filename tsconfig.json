@@ -11,5 +11,5 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["src/**/*", "evals/**/*", "tests/**/*"]
+  "include": ["src/**/*", "evals/**/*", "scripts/**/*", "tests/**/*"]
 }
