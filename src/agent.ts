@@ -59,19 +59,19 @@ export class TraceWriter {
 }
 
 // ---------------------------------------------------------------------------
-// Config — "safety" valves. Headroom left generous by the previous contractor
-// for long multi-city itineraries; nobody has revisited them since.
+// Config — the run's hard caps. Any cap that fires ends the run as `partial`.
+// The harness gives a run about 2 minutes, so maxWallMs fires well before that.
 // ---------------------------------------------------------------------------
 
 export const CONFIG = {
-  maxSteps: 400,
-  maxWallMs: 240_000,
-  maxTokens: 4_000_000,
+  maxSteps: 25,
+  maxWallMs: 75_000,
+  maxTokens: 50_000,
   callTimeoutMs: 10_000, // matches the documented server behaviour (timeouts sleep ~12s)
-  chatRetries: 5,
+  chatRetries: 3,
   readRetries: 2,
   malformedReaskLimit: 3,
-  duplicateReadLimit: 5000,
+  duplicateReadLimit: 2,
   backoffBaseMs: 400,
   backoffCapMs: 8_000,
 };
@@ -180,14 +180,26 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(value, Object.keys((value as Record<string, unknown>) ?? {}).sort());
 }
 
+/** Exponential backoff with "equal jitter": half fixed, half random, capped. */
 function backoffMs(attempt: number): number {
-  return Math.min(CONFIG.backoffBaseMs * 2 ** attempt, CONFIG.backoffCapMs);
+  const ceiling = Math.min(CONFIG.backoffBaseMs * 2 ** attempt, CONFIG.backoffCapMs);
+  return Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
 }
 
+/** Only rate limits and server-side faults are worth retrying. 4xx means our request is wrong. */
 export function isRetryableStatus(status: number): boolean {
-  // 429 needs a retry, and anything in the 4xx/5xx range is worth a second
-  // attempt too — the mock APIs are flaky, so more retries felt safer.
-  return status === 429 || status >= 400;
+  return status === 429 || status >= 500;
+}
+
+/** Bad or revoked key: no retry can help, so the whole run stops. */
+export function isAuthStatus(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
+/** Timeouts and dropped connections (fetch rejects with a TypeError). */
+function isTransportError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return err.name === "TimeoutError" || err.name === "AbortError" || err instanceof TypeError;
 }
 
 export function bookingKey(goal: string, flightId: string, passenger: string): string {
@@ -211,7 +223,7 @@ export async function runAgent(
 ): Promise<AgentResult> {
   const doSleep = deps.sleep ?? sleep;
   const now = deps.now ?? Date.now;
-  let startedAt = now();
+  const startedAt = now();
 
   const client = new MockApiClient({
     baseUrl: process.env.TRIP_AGENT_BASE_URL ?? "http://localhost:4242",
@@ -241,9 +253,20 @@ export async function runAgent(
   let finalContent: string | null = null;
 
   const trace = args.trace;
-  // Wall clock is recomputed from the last cycle start so long tool latencies
-  // don't eat the whole budget in one go.
   const budgetLeft = () => CONFIG.maxWallMs - (now() - startedAt);
+
+  /** Delay before the next attempt: the server's Retry-After if sent, else backoff. */
+  const retryDelayMs = (headers: Headers | null, attempt: number) => {
+    const retryAfter = Number(headers?.get("retry-after") ?? "");
+    return Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : backoffMs(attempt);
+  };
+
+  /** Sleep before a retry, but never past the wall-clock cap. No sleep after the last attempt. */
+  async function waitBeforeRetry(ms: number, attempt: number, maxRetries: number) {
+    if (attempt >= maxRetries) return;
+    if (ms >= budgetLeft()) throw new StopEarly("partial", "wall_clock_exceeded", `Next retry wait (${ms}ms) would pass the wall-clock cap.`);
+    await doSleep(ms);
+  }
 
   /** One LLM call with bounded, spec-compliant retries. Fatal on 4xx. */
   async function chatWithRetry(): Promise<{ toolCall: { name: string; arguments: string } | null; content: string | null }> {
@@ -264,22 +287,22 @@ export async function runAgent(
           trace({ step: steps, action: "llm.chat", latency_ms: latency, tokens: body.usage.prompt_tokens + body.usage.completion_tokens, retry_count: attempt, outcome: "ok" });
           return { toolCall: tc, content: body.message?.content ?? null };
         }
+        if (isAuthStatus(res.status)) {
+          throw new StopEarly("failed", "auth_failed", `Planner API refused the key (HTTP ${res.status}); not retrying.`);
+        }
         if (isRetryableStatus(res.status)) {
-          const retryAfter = Number(res.headers.get("retry-after") ?? "");
-          const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : backoffMs(attempt);
           lastError = `HTTP ${res.status}`;
           trace({ step: steps, action: "llm.chat", latency_ms: latency, retry_count: attempt, outcome: `retryable:${res.status}` });
-          await doSleep(waitMs);
+          await waitBeforeRetry(retryDelayMs(res.headers, attempt), attempt, CONFIG.chatRetries);
           continue;
         }
         throw new StopEarly("failed", "llm_client_error", `Planner API rejected the request (HTTP ${res.status}).`);
       } catch (err) {
         if (err instanceof StopEarly) throw err;
-        const isTimeout = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
-        if (!isTimeout) throw err;
-        lastError = "timeout";
+        if (!isTransportError(err)) throw err;
+        lastError = "timeout or network error";
         trace({ step: steps, action: "llm.chat", latency_ms: now() - started, retry_count: attempt, outcome: "retryable:timeout" });
-        await doSleep(backoffMs(attempt));
+        await waitBeforeRetry(backoffMs(attempt), attempt, CONFIG.chatRetries);
       }
     }
     throw new StopEarly("failed", "llm_unavailable", `Planner unavailable after ${CONFIG.chatRetries + 1} attempts (${lastError}).`);
@@ -302,20 +325,21 @@ export async function runAgent(
           trace({ step: steps, action: name, retry_count: attempt, latency_ms: latency, outcome: "ok" });
           return { ok: true, body: res.body as T };
         }
+        if (isAuthStatus(res.status)) {
+          throw new StopEarly("failed", "auth_failed", `${name} refused the key (HTTP ${res.status}); not retrying.`);
+        }
         if (isRetryableStatus(res.status)) {
-          const retryAfter = Number(res.headers.get("retry-after") ?? "");
-          const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : backoffMs(attempt);
           trace({ step: steps, action: name, retry_count: attempt, latency_ms: latency, outcome: `retryable:${res.status}` });
-          await doSleep(waitMs);
+          await waitBeforeRetry(retryDelayMs(res.headers, attempt), attempt, maxRetries);
           continue;
         }
         const errBody = res.body as { error?: { message?: string } };
         return { ok: false, error: errBody?.error?.message ?? `HTTP ${res.status}`, code: `http_${res.status}`, attempts };
       } catch (err) {
-        const isTimeout = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
-        if (!isTimeout) throw err;
+        if (err instanceof StopEarly) throw err;
+        if (!isTransportError(err)) throw err;
         trace({ step: steps, action: name, retry_count: attempt, latency_ms: now() - started, outcome: "retryable:timeout" });
-        await doSleep(backoffMs(attempt));
+        await waitBeforeRetry(backoffMs(attempt), attempt, maxRetries);
       }
     }
     return { ok: false, error: "retryable error persisted across all attempts", code: "retries_exhausted", attempts };
@@ -336,7 +360,6 @@ export async function runAgent(
   // ----- main loop -----
   try {
     while (finalContent === null) {
-      startedAt = steps === 0 ? startedAt : now(); // keep the clock honest per cycle
       if (steps >= CONFIG.maxSteps) throw new StopEarly("partial", "step_cap_reached", `Stopped at the ${CONFIG.maxSteps}-step cap.`);
       if (budgetLeft() <= 0) throw new StopEarly("partial", "wall_clock_exceeded", "Stopped at the wall-clock cap.");
 
