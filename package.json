@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "agent": "tsx --env-file-if-exists=.env src/agent.ts",
-    "evals": "tsx --env-file-if-exists=.env evals/run_evals.ts",
+    "agent": "tsx src/agent.ts",
+    "evals": "tsx evals/run_evals.ts",
     "trace": "tsx scripts/show-trace.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

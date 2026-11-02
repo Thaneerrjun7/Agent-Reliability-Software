@@ -15,6 +15,7 @@ export function formatTrace(text: string): string {
     let e: Entry;
     try {
       e = JSON.parse(raw);
+      if (e === null || typeof e !== "object") throw new Error("not an entry");
     } catch {
       out.push("(unreadable line)");
       continue;
@@ -30,7 +31,7 @@ export function formatTrace(text: string): string {
       (e.outcome ?? "-").padEnd(14),
       e.latency_ms === undefined ? "      -" : `${e.latency_ms}ms`.padStart(7),
       `retry=${e.retry_count ?? 0}`,
-      e.request_id ? `req=${e.request_id.slice(0, 8)}` : "",
+      e.request_id ? `req=${String(e.request_id).slice(0, 8)}` : "",
       e.detail ?? "",
     ].filter((part) => part !== "").join("  "));
   }

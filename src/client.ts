@@ -44,7 +44,11 @@ export class MockApiClient {
       body: init.body === undefined ? undefined : JSON.stringify(init.body),
       signal: init.signal,
     });
-    const body = (await res.json().catch(() => ({ error: { code: "bad_json", message: "response was not JSON" } }))) as T;
+    // Anything that is not a JSON object (not JSON at all, or the text `null`, a number, a list...) becomes
+    // the same "bad_json" envelope, so callers can always read fields off the body without crashing.
+    const parsed: unknown = await res.json().catch(() => undefined);
+    const isObject = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+    const body = (isObject ? parsed : { error: { code: "bad_json", message: "response was not a JSON object" } }) as T;
     return { status: res.status, headers: res.headers, body };
   }
 

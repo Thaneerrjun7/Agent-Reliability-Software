@@ -21,7 +21,7 @@ Assessment project. Iterate on `src/agent.ts`; do not rewrite from scratch. Just
 - Ctrl+C stops cleanly (checks the server, saves the result). Esc stops at once (saves a stub result, checks nothing).
 
 ## Run
-- Env vars: `TRIP_AGENT_BASE_URL`, `TRIP_AGENT_API_KEY` (in `.env`, gitignored).
+- Env vars: `TRIP_AGENT_BASE_URL`, `TRIP_AGENT_API_KEY`. For local runs put them in `.env` (gitignored); `src/loadenv.ts` reads it in code, with no Node flag, and never overrides variables already set.
 - `npm test` offline tests, `npm run evals` public scenarios, `npm run typecheck`.
 
 ## Process

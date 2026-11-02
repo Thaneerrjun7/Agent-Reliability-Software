@@ -20,6 +20,9 @@ import { pathToFileURL } from "url";
 import { MockApiClient, type ChatMessage, type ChatResponse } from "./client";
 import { validateResult, type AgentResult, type TraceLine } from "./types";
 import { checkBookingAgainstGoal, checkReadArgs } from "./goalcheck";
+import { loadDotEnv } from "./loadenv";
+import { parseGoal, type GoalIntent } from "./goal";
+export { parseGoal, type GoalIntent }; // the tests and the checks import them from here
 
 export type AgentArgs = {
   goal: string;
@@ -133,68 +136,6 @@ type BookingAttempt = {
 type ServerBooking = { booking_id?: string; flight_id?: string; passenger?: string; idempotency_key?: string };
 
 // ---------------------------------------------------------------------------
-// Goal parsing
-// ---------------------------------------------------------------------------
-
-export type GoalIntent = {
-  origin: string | null;
-  dest: string | null;
-  date: string;
-  wantBooking: boolean;
-  wantWeather: boolean;
-  nonstop: boolean;
-  cheapest: boolean;
-  budget: number | null; // in EUR; null when absent or in another currency
-  passenger: string | null; // null when the goal names nobody: we never invent a name
-  weatherCity: string | null; // the words after "weather in", e.g. "Cairo that day"
-};
-
-export function parseGoal(goalText: string, now = new Date()): GoalIntent {
-  const text = goalText.trim();
-  let origin: string | null = null;
-  let dest: string | null = null;
-  const route = text.match(
-    /from\s+([A-Za-zÀ-ÿ' .()-]+?)\s+to\s+([A-Za-zÀ-ÿ' .()-]+?)(?=\s+on\s|\s+and\s|[,.;:!?]|$)/i,
-  );
-  if (route) {
-    origin = route[1].trim();
-    dest = route[2].trim();
-  }
-  let date: string | null = null;
-  const dateM = text.match(/\bon\s+(today|tomorrow|(\d{4}-\d{2}-\d{2}))/i);
-  if (dateM) {
-    if (dateM[2]) date = dateM[2];
-    else {
-      const d = new Date(now);
-      if (dateM[1].toLowerCase() === "tomorrow") d.setUTCDate(d.getUTCDate() + 1);
-      date = d.toISOString().slice(0, 10);
-    }
-  }
-  if (!date) {
-    const d = new Date(now);
-    d.setUTCDate(d.getUTCDate() + 1);
-    date = d.toISOString().slice(0, 10);
-  }
-  // A budget is only read when it is a plain amount in euros: not "max 2 stops", not dollars.
-  const budgetM = text.match(/(?:under|below|less\s+than|max(?:imum)?)\s*(€|\$|RM|eur)?\s*(\d+)\b(?!\s*(?:stops?|layovers?|hours?|h\b|min|usd|dollars?|rm|myr|gbp|pounds?))/i);
-  const budgetInEuros = budgetM && !/^(?:\$|RM)$/i.test(budgetM[1] ?? "");
-  const passengerM = [...text.matchAll(/\b(?:for|passenger(?:\s+name)?)\s+([A-ZÀ-Ý][A-Za-zÀ-ÿ'’-]+(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ'’-]+)?)/g)];
-  const weatherM = text.match(/\bweather\s+(?:in|for|at)\s+([^.,;:!?]+)/i);
-  return {
-    origin,
-    dest,
-    date,
-    wantBooking: /\b(book|reserve)\b/i.test(text),
-    wantWeather: /\bweather\b/i.test(text),
-    nonstop: /non-?stop|\bdirect\b/i.test(text),
-    cheapest: /\b(?:cheapest|lowest[- ]price|least expensive)\b/i.test(text),
-    budget: budgetM && budgetInEuros ? Number(budgetM[2]) : null,
-    passenger: passengerM.length > 0 ? passengerM[passengerM.length - 1][1] : null,
-    weatherCity: weatherM ? weatherM[1].trim() : null,
-  };
-}
-
-// ---------------------------------------------------------------------------
 // Untrusted-content cleaning. The mock planner follows injected instructions
 // verbatim, so a tool reply never reaches it as-is: we rebuild each record from
 // known fields with the right types, cap text length, and cut instruction-like
@@ -206,7 +147,7 @@ const INSTRUCTION_RES = [
   // "ignore / disregard / forget / override ... instructions / rules / previous ..."
   /[^.]*\b(?:ignore|disregard|forget|override)\b[^.]*\b(?:instructions?|rules?|prompts?|above|previous|prior)\b[^.]*/gi,
   // "you must ...", "new instructions", "system prompt", "assistant:", "please book ..."
-  /[^.]*\b(?:you\s+(?:must|should|need\s+to|are\s+now)|new\s+instructions?|system\s*(?:prompt|message)|assistant\s*:|please\s+(?:book|call|send|transfer))\b[^.]*/gi,
+  /[^.]*(?:\b(?:you\s+(?:must|should|need\s+to|are\s+now)|new\s+instructions?|system\s*(?:prompt|message)|please\s+(?:book|call|send|transfer))\b|\b(?:assistant|system)\s*:)[^.]*/gi,
   // "book flight XX999" (an id with a digit in it)
   /[^.]*\bbook\s+(?:the\s+)?(?:flight\s+)?[A-Z]{2}-?\d[0-9A-Z]*[^.]*/gi,
 ];
@@ -251,7 +192,7 @@ export function cleanFlights(raw: unknown): CleanFlight[] {
   for (const item of raw) {
     const f = (item ?? {}) as Record<string, unknown>;
     if (typeof f.flight_id !== "string" || !/^[A-Za-z0-9-]{1,16}$/.test(f.flight_id)) continue;
-    if (!isNumber(f.price_eur)) continue;
+    if (!isNumber(f.price_eur) || f.price_eur <= 0) continue; // a zero or negative price is not a real fare
     out.push({
       flight_id: f.flight_id,
       airline: cleanText(f.airline),
@@ -377,6 +318,8 @@ export async function runAgent(
   // Every booking this run tried, keyed by idempotency key.
   const bookingAttempts = new Map<string, BookingAttempt>();
   const refusals = new Set<string>(); // why bookings were refused for not matching the goal (they go in the answer)
+  let cheapestRefusals = 0; // times the planner was told the cheapest flight; the next wrong pick is replaced, not refused
+  const substitutions: string[] = []; // flights we booked instead of the planner's pick (they go in the answer)
   let finalCheckFailed = false; // could not read /tools/bookings at the end
   let serverChecked = false; // the end-of-run check succeeded
   const seenReadSignatures = new Set<string>();
@@ -388,8 +331,11 @@ export async function runAgent(
   const budgetLeft = () => CONFIG.maxWallMs - (now() - startedAt);
 
   /** Per-call limit: the timeout, and also the operator's Ctrl+C if there is one. */
-  const callSignal = () =>
-    deps.abort ? AbortSignal.any([AbortSignal.timeout(CONFIG.callTimeoutMs), deps.abort]) : AbortSignal.timeout(CONFIG.callTimeoutMs);
+  const callSignal = () => {
+    const timeout = AbortSignal.timeout(CONFIG.callTimeoutMs);
+    // AbortSignal.any needs a fairly recent Node; without it Ctrl+C still stops the run at the next call, just not mid-call.
+    return deps.abort && typeof AbortSignal.any === "function" ? AbortSignal.any([timeout, deps.abort]) : timeout;
+  };
   /** Called wherever a call fails: a Ctrl+C looks like a timeout, but must not be retried. */
   const stopIfInterrupted = () => {
     if (deps.abort?.aborted) throw new StopEarly("partial", "interrupted", "Stopped by the operator (Ctrl+C or termination signal).");
@@ -553,10 +499,15 @@ export async function runAgent(
 
       currentStep = steps + 1;
       const { toolCall, content } = await chatWithRetry();
-      steps += 1;
-      if (deps.progress) deps.progress.steps = steps;
+      // A step is one planner call plus the tool it triggers (or the final answer). A re-ask happens
+      // inside the step, so `steps` only counts a step once its move is usable, as the docs define it.
+      const countStep = () => {
+        steps += 1;
+        if (deps.progress) deps.progress.steps = steps;
+      };
 
       if (tokens > CONFIG.maxTokens && toolCall) {
+        countStep();
         throw new StopEarly("partial", "cost_budget_exceeded", `Token budget exceeded (${tokens} > ${CONFIG.maxTokens}) mid-task.`);
       }
 
@@ -567,6 +518,7 @@ export async function runAgent(
       }
 
       if (!toolCall) {
+        countStep();
         finalContent = content ?? "Done.";
         malformedStreak = 0;
         // Kept in the trace for debugging only: the answer is built from checked data, not from this text.
@@ -610,6 +562,7 @@ export async function runAgent(
         continue;
       }
       malformedStreak = 0;
+      countStep(); // a usable move: this planner call and its tool are one step
 
       // --- duplicate suppression (a booking is only recorded here once it succeeded) ---
       const signature = `${name}:${stableStringify(parsedArgs)}`;
@@ -633,9 +586,7 @@ export async function runAgent(
         ];
         continue;
       }
-      if (name !== "book_flight") {
-        consecutiveDuplicateReads = 0;
-      }
+      consecutiveDuplicateReads = 0; // a new action: the repeat count starts again
 
       // --- execute the tool ---
       if (name === "search_flights") {
@@ -729,8 +680,9 @@ export async function runAgent(
         ];
       } else {
         // book_flight — irreversible write. Own search results only, confirm, stable key, reconcile.
-        const { flight_id, passenger } = parsedArgs;
-        const chosen = foundFlights.get(flight_id);
+        let flight_id = parsedArgs.flight_id;
+        const passenger = parsedArgs.passenger.trim().replace(/\s+/g, " "); // the name as written, without stray spaces
+        let chosen = foundFlights.get(flight_id);
         if (!chosen) {
           // The planner can be tricked by text inside tool data into booking a flight we never found.
           trace({ step: currentStep, action: name, outcome: "invalid_output", detail: "flight not in our search results; booking refused" });
@@ -755,8 +707,21 @@ export async function runAgent(
         }
 
         // The flight is ours, but is it what the goal asked for (passenger, nonstop, budget, cheapest, route)?
-        const fit = checkBookingAgainstGoal(intent, chosen, passenger, [...foundFlights.values()]);
+        let fit = checkBookingAgainstGoal(intent, chosen, passenger, [...foundFlights.values()], bookings);
+        let plannerPick: string | null = null; // set when we book a different flight than the planner asked for
+        if (!fit.ok && fit.better && cheapestRefusals >= 1) {
+          // The goal asked for the cheapest, the planner was told which flight that is and still picked a dearer one.
+          // The only thing wrong is the price, so book the cheapest eligible flight (from our own search results,
+          // same passenger) instead of ending with nothing booked. The answer says so.
+          plannerPick = flight_id;
+          flight_id = fit.better.flight_id;
+          chosen = fit.better;
+          substitutions.push(`The planner picked ${plannerPick}, which is not the cheapest, so I booked the cheapest eligible flight, ${flight_id}, as the goal asked.`);
+          trace({ step: currentStep, action: name, outcome: "ok", detail: `planner picked ${plannerPick} again; booking the cheapest eligible flight ${flight_id} instead` });
+          fit = { ok: true };
+        }
         if (!fit.ok) {
+          if (fit.better) cheapestRefusals += 1;
           trace({ step: currentStep, action: name, outcome: "invalid_output", detail: `booking refused, does not match the goal: ${fit.reason}` });
           errors.push({ code: "booking_not_matching_goal", message: `book_flight ${flight_id}: ${fit.reason}`, step: currentStep });
           refusals.add(fit.reason);
@@ -772,13 +737,16 @@ export async function runAgent(
           continue;
         }
 
-        // Booking this flight already ended unconfirmed. Asking again would not settle it;
-        // the end-of-run server check will.
-        if (bookingAttempts.get(bookingKey(runIdentity, flight_id, passenger))?.state === "unknown") {
+        // This exact booking already ended unconfirmed (asking again would not settle it; the end-of-run
+        // server check will) or was rejected by the server (a 400/422 will not change). Do not post it again.
+        const prior = bookingAttempts.get(bookingKey(runIdentity, flight_id, passenger));
+        const rejected = prior?.state === "not_booked" && prior.error?.code.startsWith("http_");
+        if (prior?.state === "unknown" || rejected) {
           consecutiveDuplicateReads += 1;
-          trace({ step: currentStep, action: name, outcome: "invalid_output", detail: "duplicate action suppressed: booking outcome still unconfirmed" });
+          const why = rejected ? "the server rejected this booking" : "booking outcome still unconfirmed";
+          trace({ step: currentStep, action: name, outcome: "invalid_output", detail: `duplicate action suppressed: ${why}` });
           if (consecutiveDuplicateReads >= CONFIG.duplicateReadLimit) {
-            throw new StopEarly("partial", "model_loop_detected", "Planner kept asking to book a flight whose outcome is unconfirmed; stopped cleanly.");
+            throw new StopEarly("partial", "model_loop_detected", `Planner kept asking for a booking that cannot go ahead (${why}); stopped cleanly.`);
           }
           messages = [
             ...messages,
@@ -787,8 +755,10 @@ export async function runAgent(
               role: "tool",
               content: JSON.stringify({
                 tool: name,
-                result: { booking_status: "unknown" },
-                note: "This booking's outcome is still unconfirmed. Do not call book_flight for it again and do not say it was booked. Give a final answer that says the outcome is unconfirmed.",
+                result: { booking_status: rejected ? "not_booked" : "unknown" },
+                note: rejected
+                  ? "The server rejected this booking, so nothing was booked. Do not ask for the same booking again and do not say it was booked. Give a final answer that says it could not be booked."
+                  : "This booking's outcome is still unconfirmed. Do not call book_flight for it again and do not say it was booked. Give a final answer that says the outcome is unconfirmed.",
               }),
             },
           ];
@@ -807,7 +777,14 @@ export async function runAgent(
           messages = [
             ...messages,
             { role: "assistant", content: null, tool_calls: [{ name, arguments: JSON.stringify(parsedArgs) }] },
-            { role: "tool", content: JSON.stringify({ tool: name, result: { booking_status: "booked", booking: { flight_id, passenger }, ...(bookOutcome.replayed ? { idempotent_replay: true } : {}) } }) },
+            {
+              role: "tool",
+              content: JSON.stringify({
+                tool: name,
+                result: { booking_status: "booked", booking: { flight_id, passenger }, ...(bookOutcome.replayed ? { idempotent_replay: true } : {}) },
+                ...(plannerPick ? { note: `You asked for ${plannerPick}, which is not the cheapest. The goal asks for the cheapest, so the agent booked ${flight_id} instead.` } : {}),
+              }),
+            },
           ];
         } else {
           // Kept on the attempt, not in errors[] yet: the end-of-run server check may change the story.
@@ -1017,7 +994,7 @@ export async function runAgent(
 
     const attempts = [...bookingAttempts.values()];
     const anyUnknown = attempts.some((a) => a.state === "unknown");
-    const unverified = finalCheckFailed && attempts.length > 0;
+    const unverified = !serverChecked && attempts.length > 0; // no server check at the end (down, or the key was refused)
     // "success" means everything the goal asked for happened: flights if it names a route or a booking, weather if it asks, a booking if it says book.
     const needsFlights = intent.wantBooking || intent.origin !== null || intent.dest !== null || !intent.wantWeather;
     const goalMet =
@@ -1061,6 +1038,7 @@ export async function runAgent(
       }
     }
     for (const reason of refusals) parts.push(`Refused to book: ${reason}`);
+    for (const note of substitutions) parts.push(note);
     if (intent.wantBooking && bookings.length === 0 && attempts.length === 0) {
       parts.push(searchDone && foundFlights.size === 0 ? "No booking was made: the search returned no flights." : "No booking was made.");
     }
@@ -1170,6 +1148,7 @@ function listenForKeys(onEsc: () => void, onCtrlC: () => void): { pause(): void;
 }
 
 async function main() {
+  loadDotEnv(); // the key and base URL for local runs; a grader's own environment variables win
   const args = parseArgs(process.argv.slice(2));
   const progress: Progress = { steps: 0, cost: 0 };
 

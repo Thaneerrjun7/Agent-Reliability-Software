@@ -13,14 +13,14 @@ const reasonOf = (c: ReturnType<typeof check>) => (c.ok ? "" : c.reason);
 const PORTO = "Book the cheapest nonstop flight from Porto to Oslo on 2026-11-18 for Maria Silva.";
 const SEOUL = "Book the cheapest flight from Seoul to Berlin on 2026-12-01 for Juan Perez.";
 const porto = [
-  flight("FL-P1", 180, { origin: "OPO", destination: "OSL", nonstop: false }), // cheapest, but has stops
-  flight("FL-P2", 320, { origin: "OPO", destination: "OSL", nonstop: true }), // the only right pick
-  flight("FL-P3", 410, { origin: "OPO", destination: "OSL", nonstop: true }),
+  flight("FL-P1", 180, { date: "2026-11-18", origin: "OPO", destination: "OSL", nonstop: false }), // cheapest, but has stops
+  flight("FL-P2", 320, { date: "2026-11-18", origin: "OPO", destination: "OSL", nonstop: true }), // the only right pick
+  flight("FL-P3", 410, { date: "2026-11-18", origin: "OPO", destination: "OSL", nonstop: true }),
 ];
 const seoul = [
-  flight("FL-S1", 900, { origin: "ICN", destination: "BER" }),
-  flight("FL-S2", 700, { origin: "ICN", destination: "BER" }),
-  flight("FL-S3", 700, { origin: "ICN", destination: "BER" }), // same price as S2
+  flight("FL-S1", 900, { date: "2026-12-01", origin: "ICN", destination: "BER" }),
+  flight("FL-S2", 700, { date: "2026-12-01", origin: "ICN", destination: "BER" }),
+  flight("FL-S3", 700, { date: "2026-12-01", origin: "ICN", destination: "BER" }), // same price as S2
 ];
 
 describe("parseGoal: the details the booking check relies on", () => {
@@ -31,7 +31,8 @@ describe("parseGoal: the details the booking check relies on", () => {
   });
 
   it("reads a budget only when it is a plain amount in euros", () => {
-    expect(parseGoal("Book a flight under 500 for Ana Costa").budget).toBe(500);
+    expect(parseGoal("Book a flight under 500 euros for Ana Costa").budget).toBe(500);
+    expect(parseGoal("Book a flight under 500 for Ana Costa").budget).toBeNull(); // no currency: not enforced, so never wrongly refused
     expect(parseGoal("Book a flight under €450").budget).toBe(450);
     expect(parseGoal("Book a flight under $450").budget).toBeNull(); // dollars: cannot compare with price_eur
     expect(parseGoal("Book a flight with max 2 stops").budget).toBeNull(); // not money
@@ -61,7 +62,7 @@ describe("checkBookingAgainstGoal: the public goal shapes pass", () => {
   });
 
   it("flights named in words (Porto, Oslo) match the goal too", () => {
-    const named = flight("FL-N1", 300, { origin: "Porto", destination: "Oslo", nonstop: true });
+    const named = flight("FL-N1", 300, { date: "2026-11-18", origin: "Porto", destination: "Oslo", nonstop: true });
     expect(check(PORTO, named, "Maria Silva", [named])).toEqual({ ok: true });
   });
 
@@ -75,8 +76,9 @@ describe("checkBookingAgainstGoal: each refusal", () => {
   it("(a) a different passenger, compared without case or padding", () => {
     expect(reasonOf(check(PORTO, porto[1], "Eve Mallory", porto))).toContain("Maria Silva");
     expect(check(PORTO, porto[1], "  MARIA silva ", porto)).toEqual({ ok: true });
-    expect(check(PORTO, porto[1], "Maria", porto).ok).toBe(false); // a bare first name is not the named passenger
-    expect(check(PORTO, porto[1], "Maria Silva Santos", porto).ok).toBe(true); // the parser keeps only two words of a name
+    expect(check(PORTO, porto[1], "Maria", porto).ok).toBe(true); // a first name alone is the named passenger, not someone else
+    expect(check(PORTO, porto[1], "Maria Santos", porto).ok).toBe(false); // a different surname is a different person
+    expect(check(PORTO, porto[1], "Maria Silva Santos", porto).ok).toBe(true); // a longer form of the same name
   });
 
   it("(b) a flight with stops when the goal says nonstop, naming what would be acceptable", () => {
@@ -92,7 +94,7 @@ describe("checkBookingAgainstGoal: each refusal", () => {
   });
 
   it("(c) a price over the budget", () => {
-    const goal = "Book a flight from Lisbon to Tokyo on 2026-11-03 under 500 for Maria Silva.";
+    const goal = "Book a flight from Lisbon to Tokyo on 2026-11-03 under 500 euros for Maria Silva.";
     const found = [flight("FL-A", 700), flight("FL-B", 450)];
     const c = check(goal, found[0], "Maria Silva", found);
     expect(reasonOf(c)).toContain("budget of EUR 500");
