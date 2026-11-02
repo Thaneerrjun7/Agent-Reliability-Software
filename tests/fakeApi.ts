@@ -11,20 +11,37 @@ export type PlannerMove =
 
 export type FakeBooking = { booking_id: string; flight_id: string; passenger: string; idempotency_key: string; booked_at: string };
 
-export type Override = "timeout" | { status: number; headers?: Record<string, string>; body?: unknown } | { commitThenTimeout: true };
+/**
+ * What a call does instead of the normal answer:
+ *  - "timeout": the request dies with a TimeoutError (nothing was committed).
+ *  - "networkError": the connection drops (Node's `TypeError: fetch failed`).
+ *  - { status, headers?, body? }: an HTTP reply. `raw` is sent as the exact body text instead of JSON
+ *    (an HTML error page, an empty body, the string "null").
+ *  - { commitThenTimeout }: a booking is committed on the server, then the request hangs.
+ */
+export type Override =
+  | "timeout"
+  | "networkError"
+  | { status: number; headers?: Record<string, string>; body?: unknown; raw?: string }
+  | { commitThenTimeout: true };
 
 export const FLIGHT = { flight_id: "FL-31A4", airline: "TAP", origin: "LIS", destination: "NRT", date: "2026-11-03", depart: "09:00", duration_minutes: 900, price_eur: 700, nonstop: false };
 
 export function makeFakeApi(opts: {
-  planner: PlannerMove[];
-  /** Overrides keyed by "<endpoint>#<nth call, starting at 1>", e.g. "book_flight#1". */
+  planner?: PlannerMove[];
+  /** Instead of a fixed script: the planner's move number n (0-based). Lets a test make a planner that never repeats itself. */
+  plannerFn?: (n: number) => PlannerMove;
+  /** Overrides keyed by "<endpoint>#<nth call, starting at 1>", e.g. "book_flight#1", or "<endpoint>#*" for every call that has no entry of its own. */
   overrides?: Record<string, Override>;
   searchResults?: unknown[];
+  /** The token usage every chat reply reports (default 100 + 20). */
+  usage?: { prompt_tokens: number; completion_tokens: number };
 }) {
   const bookings: FakeBooking[] = [];
-  const calls: Array<{ endpoint: string; body: any }> = [];
+  const calls: Array<{ endpoint: string; body: any; seed: string | null }> = [];
   const counts: Record<string, number> = {};
   let plannerIndex = 0;
+  const script = opts.planner ?? [];
 
   let responses = 0;
   const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
@@ -48,20 +65,30 @@ export function makeFakeApi(opts: {
     const endpoint = url.pathname.split("/").pop() ?? "";
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     counts[endpoint] = (counts[endpoint] ?? 0) + 1;
-    calls.push({ endpoint, body });
+    calls.push({ endpoint, body, seed: url.searchParams.get("seed") });
 
-    const override = opts.overrides?.[`${endpoint}#${counts[endpoint]}`];
+    const override = opts.overrides?.[`${endpoint}#${counts[endpoint]}`] ?? opts.overrides?.[`${endpoint}#*`];
     if (override === "timeout") throw timeoutError();
+    if (override === "networkError") throw new TypeError("fetch failed");
     if (override && "commitThenTimeout" in override) {
       commit(body);
       throw timeoutError();
     }
-    if (override) return json(override.status, override.body ?? { error: { code: "fault", message: "injected" } }, override.headers);
+    if (override) {
+      if (override.raw !== undefined) {
+        return new Response(override.raw, {
+          status: override.status,
+          headers: { "content-type": "application/json", "x-request-id": `req-${++responses}`, ...override.headers },
+        });
+      }
+      return json(override.status, override.body ?? { error: { code: "fault", message: "injected" } }, override.headers);
+    }
 
     switch (endpoint) {
       case "chat": {
-        const move = opts.planner[Math.min(plannerIndex++, opts.planner.length - 1)];
-        const usage = { prompt_tokens: 100, completion_tokens: 20 };
+        const n = plannerIndex++;
+        const move = opts.plannerFn ? opts.plannerFn(n) : script[Math.min(n, script.length - 1)];
+        const usage = opts.usage ?? { prompt_tokens: 100, completion_tokens: 20 };
         const message = "say" in move
           ? { role: "assistant", content: move.say, tool_calls: null }
           : { role: "assistant", content: null, tool_calls: [{ name: move.call, arguments: typeof move.args === "string" ? move.args : JSON.stringify(move.args) }] };
@@ -82,7 +109,10 @@ export function makeFakeApi(opts: {
     }
   }) as typeof fetch;
 
-  return { fetchImpl, bookings, calls, count: (endpoint: string) => counts[endpoint] ?? 0 };
+  /** Everything the planner was ever sent (all messages of every chat request), as one string. */
+  const sentToPlanner = () => calls.filter((c) => c.endpoint === "chat").map((c) => JSON.stringify(c.body.messages)).join("\n");
+
+  return { fetchImpl, bookings, calls, count: (endpoint: string) => counts[endpoint] ?? 0, sentToPlanner };
 }
 
 export const GOAL = "Find a flight from Lisbon to Tokyo on 2026-11-03 and book it for Maria Silva";
