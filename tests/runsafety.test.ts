@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { promises as fs, readFileSync, existsSync } from "fs";
 import os from "os";
 import path from "path";
-import { TraceWriter, parseAndRun, runAgent, stoppedNowResult } from "../src/agent";
+import { TraceWriter, describeResult, parseAndRun, runAgent, stoppedNowResult } from "../src/agent";
 import { validateResult } from "../src/types";
 import { BOOK, GOAL, SEARCH, makeFakeApi } from "./fakeApi";
 
@@ -54,6 +54,19 @@ describe("step numbers are 1-based, as the docs describe", () => {
     const result = await runAgent({ goal: GOAL, seed: "t", autoConfirm: true, trace: () => {} }, { fetchImpl: api.fetchImpl, sleep: noSleep });
     expect(result.errors.find((e) => e.code === "llm_unavailable")?.step).toBe(1);
     expect(result.errors.every((e) => (e.step ?? 1) >= 1)).toBe(true);
+  });
+});
+
+describe("what the person running the CLI sees at the end", () => {
+  it("says how the run ended, the answer, the errors and where the files are", () => {
+    const text = describeResult(
+      { status: "partial", answer: "Found 2 flight option(s).", bookings: [], steps: 3, cost: 910, errors: [{ code: "step_cap_reached", message: "x", step: 3 }] },
+      { output: "out/r.json", trace: "out/t.jsonl" },
+    );
+    expect(text).toContain("PARTIAL: 3 step(s), 910 tokens, 0 booking(s), 1 error(s)");
+    expect(text).toContain("Found 2 flight option(s).");
+    expect(text).toContain("Errors: step_cap_reached");
+    expect(text).toContain("Result: out/r.json   Trace: out/t.jsonl");
   });
 });
 

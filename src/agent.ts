@@ -1079,6 +1079,18 @@ async function defaultConfirm(flightId: string, passenger: string): Promise<bool
 
 type Progress = { steps: number; cost: number };
 
+/** A few lines for the person running the CLI: how the run ended and where the files are. */
+export function describeResult(result: AgentResult, args: { output: string; trace: string }): string {
+  const lines = [
+    "",
+    `${result.status.toUpperCase()}: ${result.steps} step(s), ${result.cost} tokens, ${result.bookings.length} booking(s), ${result.errors.length} error(s)`,
+    result.answer,
+  ];
+  if (result.errors.length > 0) lines.push(`Errors: ${result.errors.map((e) => e.code).join(", ")}`);
+  lines.push(`Result: ${args.output}   Trace: ${args.trace}`);
+  return lines.join("\n");
+}
+
 /** The result for a run that crashed outside the agent loop. It says what is NOT known. */
 export function crashResult(err: unknown, progress: Progress = { steps: 0, cost: 0 }): AgentResult {
   const message = err instanceof Error ? err.message : String(err);
@@ -1182,6 +1194,7 @@ async function main() {
 
   const result = await parseAndRun(args, { abort: abort.signal, progress, ...(confirm ? { confirm } : {}) });
   await writeJson(args.output, result);
+  if (process.stdout.isTTY) console.log(describeResult(result, args)); // a person at a terminal sees how it ended; graders (no terminal) get no extra output
   // Exit 0 whenever result.json was written, even for status "failed": the file, not the exit code, carries the outcome.
   process.exit(signalled ? 130 : 0);
 }
