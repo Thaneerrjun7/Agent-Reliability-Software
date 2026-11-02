@@ -38,7 +38,7 @@ export function makeFakeApi(opts: {
   usage?: { prompt_tokens: number; completion_tokens: number };
 }) {
   const bookings: FakeBooking[] = [];
-  const calls: Array<{ endpoint: string; body: any }> = [];
+  const calls: Array<{ endpoint: string; body: any; seed: string | null }> = [];
   const counts: Record<string, number> = {};
   let plannerIndex = 0;
   const script = opts.planner ?? [];
@@ -65,7 +65,7 @@ export function makeFakeApi(opts: {
     const endpoint = url.pathname.split("/").pop() ?? "";
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     counts[endpoint] = (counts[endpoint] ?? 0) + 1;
-    calls.push({ endpoint, body });
+    calls.push({ endpoint, body, seed: url.searchParams.get("seed") });
 
     const override = opts.overrides?.[`${endpoint}#${counts[endpoint]}`] ?? opts.overrides?.[`${endpoint}#*`];
     if (override === "timeout") throw timeoutError();

@@ -767,3 +767,34 @@ describe("what a failed run leaves on disk", () => {
     expect(JSON.stringify(written)).not.toContain(secret);
   });
 });
+
+describe("the run's seed", () => {
+  // The server keeps bookings per seed. A bookings read without it looks at someone else's list, so the
+  // "did my booking go through?" answer (in-run reconcile and end-of-run check) would be about the wrong run.
+  it("is sent on every request: planner, tools, booking, the planner's bookings tool, reconcile and the end-of-run check", async () => {
+    const { api } = await run({ planner: [SEARCH, WEATHER, BOOK, BOOKINGS_TOOL, DONE], overrides: { "book_flight#1": { commitThenTimeout: true } } });
+    expect(new Set(endpoints(api))).toEqual(new Set(["chat", "search_flights", "get_weather", "book_flight", "bookings"]));
+    expect(api.count("bookings")).toBeGreaterThanOrEqual(3); // reconcile after the timeout, the planner's own call, the end check
+    for (const call of api.calls) {
+      // The chat endpoint takes the seed in its JSON body; every tool endpoint takes it as ?seed=.
+      const seed = call.endpoint === "chat" ? call.body.seed : call.seed;
+      expect(seed, `${call.endpoint} must carry the seed`).toBe("t");
+    }
+  });
+});
+
+describe("the shipped limits", () => {
+  // The tests above are written against CONFIG, so on their own they could not notice a limit that
+  // was raised until it means nothing (e.g. chatRetries = 1000). These pin what the failure policy promises.
+  it("are the documented caps, and every retry loop is small", () => {
+    expect(saved.maxSteps).toBe(25);
+    expect(saved.maxWallMs).toBe(60_000);
+    expect(saved.maxTokens).toBe(50_000);
+    expect(saved.maxMessages).toBe(50);
+    expect(saved.malformedReaskLimit).toBe(3);
+    for (const retries of [saved.chatRetries, saved.readRetries, saved.bookRetries]) {
+      expect(retries).toBeGreaterThanOrEqual(1);
+      expect(retries).toBeLessThanOrEqual(5);
+    }
+  });
+});
