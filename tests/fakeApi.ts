@@ -26,8 +26,12 @@ export function makeFakeApi(opts: {
   const counts: Record<string, number> = {};
   let plannerIndex = 0;
 
+  let responses = 0;
   const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
-    new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json", "x-request-id": `req-${++responses}`, ...headers },
+    });
 
   const timeoutError = () => Object.assign(new Error("The operation timed out"), { name: "TimeoutError" });
 

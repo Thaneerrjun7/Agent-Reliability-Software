@@ -19,6 +19,7 @@ export type TraceLine = {
   retry_count?: number;
   outcome?: string;
   detail?: string;
+  request_id?: string; // the server's x-request-id for this response
 };
 
 /** Minimal validation — enough to catch a malformed result before submission. */

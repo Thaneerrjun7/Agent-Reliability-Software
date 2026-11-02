@@ -60,6 +60,12 @@ describe("the answer is built from checked data only", () => {
     expect(result.answer).toContain("EUR 700"); // the real price from the search result
   });
 
+  it("says why nothing was booked when the search found no flights", async () => {
+    const { result } = await run({ planner: [SEARCH, { say: "Sorry." }], searchResults: [], goal: "Book a flight from Paris to Paris on 2026-11-01 for Anna Nowak." });
+    expect(result.bookings).toHaveLength(0);
+    expect(result.answer).toContain("No booking was made: the search returned no flights.");
+  });
+
   it("does not invent a passenger when the goal names nobody", () => {
     expect(parseGoal("Find a flight from Lisbon to Tokyo on 2026-11-03").passenger).toBeNull();
     expect(parseGoal("Book a flight for Maria Silva").passenger).toBe("Maria Silva");
