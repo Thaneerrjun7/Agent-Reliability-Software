@@ -65,6 +65,8 @@ export function makeFakeApi(opts: {
       }
       case "search_flights":
         return json(200, { results: opts.searchResults ?? [FLIGHT] });
+      case "get_weather":
+        return json(200, { city: body.city, date: body.date, temperature_c: 12, conditions: "Cloudy", stale: false });
       case "book_flight": {
         const already = bookings.some((b) => b.idempotency_key === body.idempotency_key);
         return json(200, { booking: commit(body), ...(already ? { idempotent_replay: true } : {}) });

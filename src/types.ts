@@ -18,6 +18,7 @@ export type TraceLine = {
   tokens?: number;
   retry_count?: number;
   outcome?: string;
+  detail?: string;
 };
 
 /** Minimal validation — enough to catch a malformed result before submission. */
